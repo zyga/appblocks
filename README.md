@@ -8,9 +8,8 @@ Why?
 
 For better control, testing and reliability of command line apps.
 
-How
-===
-
+How?
+====
 AppBlocks allows you to create command line applications out of interconnected
 elements. Each element performs a dedicated function such as computation,
 presentation or user interaction.

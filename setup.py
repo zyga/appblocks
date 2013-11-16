@@ -26,6 +26,7 @@ setup(
     classifiers=classifiers.splitlines(),
     platforms=['any'],
     packages=['appblocks'],
+    test_suite='appblocks',
     url='http://zyga.github.io/appblocks/',
     author="Zygmunt Krynicki",
     author_email="<zkrynicki@gmail.com>")
