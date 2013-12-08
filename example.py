@@ -15,6 +15,8 @@ class Add(Block):
 
 class HelloWorld(Network):
     print = PrintText()
+    import pdb
+    pdb.set_trace()
     print.text = Add(a=Constant("Hello"), b=Constant(" World"))
 
 

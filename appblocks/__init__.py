@@ -384,7 +384,11 @@ class InputPort(Port):
             guaranteed. It is never None.
         :param value:
             A value that is being assigned. This must be a
-            :class:`BoundOutputPort` instance.
+            :class:`BoundOutputPort` instance or :class:`Block` instance
+            that has a :class:``OutputPort` with the :attr:`OutputPort.primary`
+            attribute set to True. The second form is used as a shortcut
+            for blocks that produce the typical result on a designated output
+            port.
         :returns:
             None
         :raises AttributeError:
@@ -417,11 +421,20 @@ class InputPort(Port):
         if getattr(instance, '_call_in_progress', False):
             raise AttributeError("input ports are read-only")
         else:
-            if not isinstance(value, BoundOutputPort):
-                raise TypeError("rvalue must be a BoundOutputPort")
-            if value.block is instance:
+            if isinstance(value, Block):
+                block = value
+                if block._primary_output_port is None:
+                    raise ValueError(
+                        "block {!r} has no primary output port".format(
+                            value.__class__))
+                bound_output_port = getattr(block, block._primary_output_port.name)
+            elif isinstance(value, BoundOutputPort):
+                bound_output_port = value
+            else:
+                raise TypeError("rvalue must be a BoundOutputPort or a Block")
+            if bound_output_port.block is instance:
                 raise ValueError("cannot form connections to the same block")
-            setattr(instance, self._con_attr, value)
+            setattr(instance, self._con_attr, bound_output_port)
 
 
 class TriggerPort(InputPort):
@@ -646,13 +659,7 @@ class BlockType(type):
         This collects all of the :class:`Port` instances from this and base
         classes and assigns that to a `_ports` attribute on the new class.
         """
-        ports = {}
-        for base in bases:
-            if issubclass(base, Block):
-                ports.update(base._ports)
-        for attr_name, attr_value in namespace.items():
-            if isinstance(attr_value, Port):
-                ports[attr_name] = attr_value
+        # Inject special ports, unless already defined
         if 'trigger' not in namespace:
             namespace['trigger'] = TriggerPort(
                 doc='input port for control over execution flow (implicit)',
@@ -666,10 +673,28 @@ class BlockType(type):
         if 'error' not in namespace:
             namespace['error'] = ErrorPort(
                 doc='output port set to escaped exceptions (implicit)')
+        # Compute and store the _ports class-attribute
+        ports = {}
+        for base in bases:
+            if issubclass(base, Block):
+                ports.update(base._ports)
+        for attr_name, attr_value in namespace.items():
+            if isinstance(attr_value, Port):
+                ports[attr_name] = attr_value
+        namespace['_ports'] = ports
+        # Set name of any port that needs it
         for attr_name, attr_value in namespace.items():
             if isinstance(attr_value, Port) and attr_value.name is None:
                 attr_value.name = attr_name
-        namespace['_ports'] = ports
+        # Compute and store the _primary_output_port class-attribute
+        primary_list = [
+            port for port in ports.values() 
+            if port.direction == OUT and port.primary]
+        if len(primary_list) > 1:
+            raise ValueError("only one port per block may be primary")
+        namespace['_primary_output_port'] = (
+            primary_list[0] if len(primary_list) == 1
+            else None)
         return type.__new__(mcls, name, bases, namespace)
 
 
@@ -822,7 +847,36 @@ class BlockTests(unittest.TestCase):
 class NetworkType(type):
 
     def __new__(mcls, name, bases, namespace):
-        return type.__new__(mcls, name, bases, namespace)
+        blocks = set()
+        if False:
+            # XXX: disabled because of unclear inheritance semantics
+            for base in bases:
+                if isinstance(base, Network):
+                    blocks.update(base._blocks)
+        for attr_name, attr_value in namespace.items():
+            if isinstance(attr_value, Block):
+                blocks.add(attr_value)
+        for block in blocks:
+            for port in block._ports:
+                if port.direction == IN:
+                    bound_input_port = getattr(block, port.name)
+                    bound_output_port = bound_input_port.connected_to
+                    if bound_output_port is not None:
+                        other_block = bound_output_port.block
+                        blocks.add(other_block)
+        namespace['_blocks'] = blocks
+        print("Creating network {} with blocks {}".format(
+            name, blocks))
+        cls = type.__new__(mcls, name, bases, namespace)
+        if bases:
+            cls._verify_topology()
+        return cls
+
+
+class TopologyError(Exception):
+    """
+    Exception raised if there is a problem with the way a network is wired.
+    """
 
 
 class Network(metaclass=NetworkType):
@@ -850,6 +904,16 @@ class Network(metaclass=NetworkType):
     # TODO: have a method to execute the network in an executor (probably
     # future based)
 
+    @classmethod
+    def _verify_topology(cls):
+        if not cls._blocks:
+            raise TopologyError("no blocks at all")
+        initial_list = [
+            block for block in cls._blocks
+            if block._is_ready]
+        if not initial_list:
+            raise TopologyError("no blocks are initially ready")
+
     def run(self, executor=None):
         """
         Execute the network.
@@ -869,4 +933,13 @@ class Network(metaclass=NetworkType):
         performance as all ready blocks are scheduled for execution ion a
         separate process.
         """
+        if not self._blocks:
+            raise TopologyError
+        while True:  # when do we finish?
+            ready = []
+            for block in self._blocks:
+                if block._is_ready:
+                    ready.append(block)
+            if not ready:
+                raise TopologyError("there are no blocks")
         raise NotImplementedError()
