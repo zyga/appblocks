@@ -60,6 +60,9 @@ explicit ordering of operations.  It may also speed up certain operations
 """
 
 import unittest
+import logging
+import concurrent.futures.process
+
 
 __all__ = [
     'Block',
@@ -73,6 +76,9 @@ __all__ = [
 # Constants for Port.direction
 IN = "in"
 OUT = "out"
+
+# Logger for appblocks
+_logger = logging.getLogger("appblocks")
 
 
 class UnsetType:
@@ -319,6 +325,10 @@ class InputPort(Port):
         super().__init__(doc, name)
         self.default = default
 
+    def __repr__(self):
+        return "{}(name={!r}, default={!r})".format(
+            self.__class__.__name__, self.name, self.default)      
+
     @property
     def direction(self):
         """
@@ -519,6 +529,10 @@ class OutputPort(Port):
         super().__init__(doc, name)
         self.primary = primary
 
+    def __repr__(self):
+        return "{}(name={!r}, primary={!r})".format(
+            self.__class__.__name__, self.name, self.primary)      
+
     @property
     def direction(self):
         """
@@ -695,6 +709,7 @@ class BlockType(type):
         namespace['_primary_output_port'] = (
             primary_list[0] if len(primary_list) == 1
             else None)
+        _logger.debug("Creating block %r with ports %r", name, ports)
         return type.__new__(mcls, name, bases, namespace)
 
 
@@ -776,7 +791,9 @@ class Block(metaclass=BlockType):
         self._call_in_progress = True
         self.ready = True
         try:
-            self()
+            retval = self()
+            if self._primary_output_port:
+                setattr(self, self._primary_output_port.name, retval)
         except Exception as exc:
             self.error = exc
         else:
@@ -865,8 +882,7 @@ class NetworkType(type):
                         other_block = bound_output_port.block
                         blocks.add(other_block)
         namespace['_blocks'] = blocks
-        print("Creating network {} with blocks {}".format(
-            name, blocks))
+        _logger.debug("Creating network %r with blocks %r", name, blocks)
         cls = type.__new__(mcls, name, bases, namespace)
         if bases:
             cls._verify_topology()
@@ -876,6 +892,15 @@ class NetworkType(type):
 class TopologyError(Exception):
     """
     Exception raised if there is a problem with the way a network is wired.
+    """
+
+
+class DeadLockError(Exception):
+    """
+    Exception raised if a network dead-lock is detected.
+
+    A dead-lock occurs when a there are blocks left unprocessed but
+    no further blocks can be processed.
     """
 
 
@@ -913,6 +938,9 @@ class Network(metaclass=NetworkType):
             if block._is_ready]
         if not initial_list:
             raise TopologyError("no blocks are initially ready")
+        # TODO: detect loops
+        # TODO: detect disconnected error output ports
+        # TODO: detect disconnected input ports
 
     def run(self, executor=None):
         """
@@ -933,13 +961,15 @@ class Network(metaclass=NetworkType):
         performance as all ready blocks are scheduled for execution ion a
         separate process.
         """
-        if not self._blocks:
-            raise TopologyError
-        while True:  # when do we finish?
-            ready = []
-            for block in self._blocks:
-                if block._is_ready:
-                    ready.append(block)
-            if not ready:
-                raise TopologyError("there are no blocks")
-        raise NotImplementedError()
+        if executor is None:
+            executor = concurrent.futures.process.ProcessPoolExecutor()
+        try:
+            todo = self._blocks.copy()
+            while todo:
+                ready = [block for block in todo if block._is_ready]
+                if not ready:
+                    raise DeadLockError("dead-lock on: {!r}".format(todo))
+                for block in ready:
+                    result = executor.submit(block._execute)
+        finally:
+            executor.shutdown()
