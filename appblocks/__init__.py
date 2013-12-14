@@ -59,9 +59,11 @@ explicit ordering of operations.  It may also speed up certain operations
 (though regular python GIL limitations apply).
 """
 
-import unittest
-import logging
+import abc
 import concurrent.futures.process
+import concurrent.futures.thread
+import logging
+import unittest
 
 
 __all__ = [
@@ -238,6 +240,50 @@ class BoundOutputPort(BoundPort):
         super().__init__(block, port)
 
 
+class PortIOPolicy(metaclass=abc.ABCMeta):
+    """
+    Policy on how to do port input/output operations.
+
+    Pots are an input/output abstraction. There are times, however, when
+    actual values need to be stored or loaded. In such cases the port i/o 
+    policy object decides on how this is actually implemented.
+
+    Note that typically, one policy object can be used with all ports in the
+    system, it's not required for each port to have a custom policy object.
+    """
+
+    @abc.abstractmethod
+    def read_from_port(self, block, port):
+        """
+        Read a value from a port attached to a specific block.
+        """
+
+    @abc.abstractmethod
+    def write_to_port(self, block, port, value):
+        """
+        Write a value to a port attached to a specific block.
+        """
+
+
+class MemoryPortIOPolicy(PortIOPolicy):
+    """
+    Port input/output policy that stores data internally.
+    """
+
+    def __init__(self, network):
+        self._network = network
+        self._values = {}
+
+    def read_from_port(self, block, port):
+        """
+        Read a value from a port attached to a specific block.
+        """
+        return self._values.get((block, port), Unset)
+
+    def write_to_port(self, block, port, value):
+        self._values[(block, port)] = value
+
+
 class Port:
     """
     A input/output abstraction for blocks.
@@ -265,6 +311,10 @@ class Port:
         """
         self.name = name
         self.__doc__ = doc
+        self._io_policy = None
+
+    def __hash__(self):
+        return hash(self.name)
 
     def __repr__(self):
         return "{}(name={!r})".format(self.__class__.__name__, self.name)
@@ -756,6 +806,9 @@ class Block(metaclass=BlockType):
                     "there is no port called {}".format(port_name))
             setattr(self, port_name, port_value)
 
+    def __hash__(self):
+        return id(self)            
+
     def __repr__(self):
         # TODO: display ports maybe?
         return "<{} object at {:x}>".format(self.__class__.__name__, id(self))
@@ -800,6 +853,31 @@ class Block(metaclass=BlockType):
             self.done = True
         finally:
             del self._call_in_progress
+
+
+def block(func):
+    """
+    A decorator for making Block subclasses out of functions
+    """
+    namespace = {}
+    for name, value in func.__annotations__.items():
+        if name == "return":
+            if "retval" in func.__annotations__:
+                raise ValueError("The name retval is reserved")
+            if not isinstance(value, OutputPort):
+                raise TypeError("Return value annotation must be an OutputPort")
+            name = "retval"
+        else:
+            if not isinstance(value, InputPort):
+                raise TypeError("Argument {} annotation must be an InputPort"\
+                    .format(name))
+        namespace[name] = value
+    cls = BlockType.__new__(BlockType, func.__name__, Block, namespace)
+    return cls()
+
+
+class BlockDecoratorTests(unittest.TestCase):
+    pass
 
 
 class BlockTests(unittest.TestCase):
@@ -862,6 +940,12 @@ class BlockTests(unittest.TestCase):
 
 
 class NetworkType(type):
+    """
+    Type of all network classes.
+
+    The NetworkType class is responsible for collecting all of the block objects
+    into a _blocks set.
+    """
 
     def __new__(mcls, name, bases, namespace):
         blocks = set()
@@ -922,7 +1006,6 @@ class Network(metaclass=NetworkType):
             consumer.input = producer.output
     """
 
-    # TODO: use a metaclass to ensure the network is wired correctly
     # TODO: use inheritance to support a form of network code reuse
     # TODO: do something smart inside instantiated network, maybe keep all of
     # the data flow inside there?
@@ -968,7 +1051,7 @@ class Network(metaclass=NetworkType):
             while todo:
                 ready = [block for block in todo if block._is_ready]
                 if not ready:
-                    raise DeadLockError("dead-lock on: {!r}".format(todo))
+                    raise DeadLockError("dead-lock with: {!r}".format(todo))
                 for block in ready:
                     result = executor.submit(block._execute)
         finally:
